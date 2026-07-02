@@ -22,21 +22,21 @@ User problem
 │  Solver     │  Qwen2.5-72B via HF Inference Router
 │  Agent      │  Emits structured CLAIM line
 └──────┬──────┘
-│
-▼
+       │
+       ▼
 ┌─────────────┐        ┌─────────────────────────┐
 │  Verifier   │◄──────►│  MCP Server (SSE)       │
 │  Node       │        │  SymPy: su_n_generators │
 └──────┬──────┘        │  commutator, f_abc      │
-│                      └─────────────────────────┘
-│ fail
-▼
+       │               └─────────────────────────┘
+       │ fail
+       ▼
 ┌─────────────┐
 │  Critic     │  Qwen2.5-72B, structured JSON feedback
 │  Agent      │
 └──────┬──────┘
-│ retry
-└──────► Solver (up to 3 retries)
+       │ retry
+       └──────► Solver (up to 3 retries)
 ```
 
 The verifier runs as a standalone `MCP` server inside the same container, communicating with the `LangGraph` graph over `SSE` transport on `localhost:8000`. The agent side has no direct SymPy dependency — it calls a tool over the wire and receives a JSON result.
