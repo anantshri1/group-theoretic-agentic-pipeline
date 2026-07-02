@@ -25,10 +25,10 @@ User problem
 │
 ▼
 ┌─────────────┐        ┌─────────────────────────┐
-│  Verifier   │◄──────►│  MCP Server (SSE)        │
-│  Node       │        │  SymPy: su_n_generators  │
-└──────┬──────┘        │  commutator, f_abc       │
-│               └─────────────────────────┘
+│  Verifier   │◄──────►│  MCP Server (SSE)       │
+│  Node       │        │  SymPy: su_n_generators │
+└──────┬──────┘        │  commutator, f_abc      │
+│                      └─────────────────────────┘
 │ fail
 ▼
 ┌─────────────┐
