@@ -236,3 +236,58 @@ With these design decisions in place, we assessed the performance of the `verifi
 
 ### Design goal for `llm_judge`
 A generic, reusable "ask an LLM to adjudicate something given context" utility, narrow enough for Stage 2's polarity-check, general enough that Stage 3's Critic can call the same function later with a richer payload.
+
+The polarity check uses `llm_judge` to determine whether the Solver's prose conclusion (true/false) matches the Verifier's symbolic result, and returns both the raw judge response and the computed match/mismatch boolean.
+
+With these, we wire everything together using `LangGraph` and test the performance of the Solver and Verifier on the following questions:
+
+```
+...
+batch_problems = [
+    # Original 5, re-run fresh through full Stage 2 pipeline
+    "Verify that for su(2), [T_1, T_2] = i*T_3, where T_a = sigma_a / 2 and sigma_a are the Pauli matrices.",
+    "Compute the structure constant f_123 for su(3) using the convention T_a = lambda_a / 2, where lambda_a are the Gell-Mann matrices.",
+    "Is the following a valid su(3) commutation relation? [T_4, T_5] = (i/2)*T_3 + (i*sqrt(3)/2)*T_8",
+    "Compute the structure constant f_246 for su(3) using the convention T_a = lambda_a / 2, where lambda_a are the Gell-Mann matrices.",
+    "Is the following a valid su(3) commutation relation? [T_1, T_2] = i*T_3 + i*T_8",
+    # New su(4) stress test
+    "Is the following a valid su(4) commutation relation? [T_1, T_2] = i*T_3",
+    # Open-ended prompt, likely to NOT produce a clean final verify/compute claim
+    "Explain, in general terms, why su(3) has exactly 8 generators and what role the Cartan subalgebra plays.",
+]
+...
+```
+
+The results are in agreement, indicating the pipeline is working as expected:
+```
+================================================================================
+PROBLEM 0: Verify that for su(2), [T_1, T_2] = i*T_3, where T_a = sigma_a / 2 and sigma_a are the Pau
+verified: True | polarity_match: True
+verifier_detail: Checked [Ta,Tb] vs claimed RHS for su(2). Equal: True
+================================================================================
+PROBLEM 1: Compute the structure constant f_123 for su(3) using the convention T_a = lambda_a / 2, wh
+verified: True | polarity_match: True
+verifier_detail: f_abc computed=1, claimed=1 for su(3). Equal: True
+================================================================================
+PROBLEM 2: Is the following a valid su(3) commutation relation? [T_4, T_5] = (i/2)*T_3 + (i*sqrt(3)/2
+verified: True | polarity_match: True
+verifier_detail: Checked [Ta,Tb] vs claimed RHS for su(3). Equal: True
+================================================================================
+PROBLEM 3: Compute the structure constant f_246 for su(3) using the convention T_a = lambda_a / 2, wh
+verified: True | polarity_match: True
+verifier_detail: f_abc computed=1/2, claimed=1/2 for su(3). Equal: True
+================================================================================
+PROBLEM 4: Is the following a valid su(3) commutation relation? [T_1, T_2] = i*T_3 + i*T_8
+verified: False | polarity_match: True
+verifier_detail: Checked [Ta,Tb] vs claimed RHS for su(3). Equal: False
+================================================================================
+PROBLEM 5: Is the following a valid su(4) commutation relation? [T_1, T_2] = i*T_3
+verified: True | polarity_match: True
+verifier_detail: Checked [Ta,Tb] vs claimed RHS for su(4). Equal: True
+================================================================================
+PROBLEM 6: Explain, in general terms, why su(3) has exactly 8 generators and what role the Cartan sub
+verified: None | polarity_match: None
+verifier_detail: UNPARSEABLE: No line starting with 'CLAIM:' found in solver output.
+```
+
+
