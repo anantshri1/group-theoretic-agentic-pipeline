@@ -85,7 +85,7 @@ The scope for this section was as follows:
 > Since the `Solver` doesn't call `SymPy` and isn't checked, there's a real chance `DeepSeek` just confidently produces wrong group theory (these are exactly the kind of index-gymnastics calculations LLMs flub).
 
 
-**Architecture of state schema and solver at this stage**:
+### Architecture of state schema and solver at this stage
 * `SolverState` is deliberately minimal (just 2 fields) — this is the contract Stage 2's `Verifier` will need to extend (it'll likely add a `verified: bool or verifier_notes: str` field later). Keeping it lean now means Stage 2's diff is additive, not a rewrite.
 * The node function takes the whole state in and returns the whole state out — that's the `LangGraph` convention (nodes are state transformers), even though right now it feels like overkill for a single field update.
 
@@ -145,3 +145,94 @@ For my records — **solver baseline correctly identifies false claims but exhib
 
 ## Single-Pass Solver & Verifier
 
+**Summary of Design of this stage**
+
+* Grammar: two-tag `CLAIM: <algebra> | COMMUTATOR | [Ta,Tb] = expr` / `CLAIM: <algebra> | STRUCTURE_CONST | f_abc = value`, trivial transcription not translation
+* Algebra scope: general `su(N)` via existing `su_n_generators`, not just `su(2)`/`su(3)`
+* Mismatch signal: recorded separately via generic `llm_judge(context, question)` utility, no auto-reconciliation — reused later for Stage 3's `Critic`
+* State: two-node `StateGraph (solver → verifier → END)` **now**, not deferred to Stage 3
+* Parsing: standalone `parse_claim()` function, fail loudly on malformed input
+* Judge model: `Gemma 4 31B-it` via `featherless-ai`, documented sampling defaults
+
+### The mini-grammar for the Solver's final line
+
+**Architectural Choice**: Constrain the Solver's output format now.
+
+Change the Solver's prompt to emit a structured claim at the end — e.g. a final line like `CLAIM: [T1,T2] = i*T3` in a fixed mini-grammar — while still letting it reason freely in prose before that. The Verifier then only ever has to parse that one structured line, not the whole free-text trace.
+
+* Pro: Verifier parsing is trivial and robust. Clean separation of concerns.
+* Con: Now doing prompt engineering to constrain Solver output, which touches Stage 1 code you just finished. Also risks the Solver "filling in" the structured line confidently even when its prose trace was shaky (your reasoning-wobble finding) — structure can paper over wobble rather than exposing it.
+
+We need something that:
+* Is easy for the LLM to produce reliably (so it doesn't become a new failure mode)
+* Is trivial for SymPy-side code to parse deterministically (no LLM-in-the-loop parsing)
+* Covers both problem types tested in Stage 1: commutator identities ($[T_a, T_b] = if_{abc}T_c$ style) and bare structure-constant queries ($f_{246}$ = ?)
+
+Candidate:
+```
+CLAIM: <algebra> | <expression>
+```
+Where:
+* `<algebra>` is something like `su(2)` or `su(3)` — tells the `Verifier` which generator set to build
+* `<expression>` is a single equation in terms of $T_1, T_2, ..., T_N$ and $i, +, -, *, /, \sqrt{3}$, integers/fractions — e.g.:
+  * $[T_1, T_2] = iT_3$,
+  * $f_{246} = \tfrac{1}{2}$,
+  * $[T_4,T_5] = \tfrac{i}{2}T_3 + i\tfrac{\sqrt{3}}{2}T_8$.
+
+
+So the Solver's prompt gets one addition:
+```
+"After your reasoning, end your response with exactly one line in this format: CLAIM: <algebra> | <expression>, restating your final answer as a precise symbolic equation. Do not add anything after this line."
+```
+
+> Could forcing everything into commutator form break the grammar?
+Let's think about what *"forcing into commutator form"* actually demands of the LLM for each claim type:
+> * Commutator-identity problems (Problem 1, 3, 5 from Stage 1): already naturally $[T_a,T_b] = ....$; no translation needed — trivial.
+> * Bare structure-constant problems (Problem 2, 4 — "compute $f_{123}$"): the LLM has to invent a commutator wrapper around its scalar answer. E.g. it computed $f_{123} = 1$, and now has to emit `[T1,T2] = i*1*T3` i.e. `[T1,T2] = i*T3`. That's an extra symbolic step — turning a scalar into a full equation — done after the reasoning, in the one line we're not supervising with chain-of-thought.
+
+> That's exactly where **deformation risk lives**: it's a translation step happening with no visible reasoning, by an LLM that we already know (Problem 2) is capable of *"right answer, sloppy method"* on this exact kind of indexing task. A wrong translation here wouldn't even be a math error — it'd be a formatting error that looks like a parse failure or, worse, silently produces a well-formed but wrong claim (e.g. wrong sign, wrong target index `Tc`, wrong factor of `i`) that the `Verifier` then "correctly" rejects for the wrong reason. That muddies the Stage 2 signal: failures could mean `"Solver's math is wrong"` or `"Solver's grammar-translation is wrong"` and you can't tell which from the `CLAIM` line alone.
+
+> Keep two claim shapes at the grammar level, but make both trivial transcriptions (not translations) of what the Solver already computed:
+```
+CLAIM: <algebra> | COMMUTATOR | [Ta, Tb] = expr
+CLAIM: <algebra> | STRUCTURE_CONST | f_abc = value
+```
+> The Solver just copies its already-derived final answer into the matching template — no new derivation step, no scalar→equation invention. The `Verifier` dispatches on the tag (`COMMUTATOR` vs `STRUCTURE_CONST`) and runs the appropriate check (full matrix identity vs. scalar `f_abc_computed` lookup). Two code paths in the Verifier, yes — but each is simpler than one path that also has to assume the Solver's translation was faithful.
+
+### Architectural Design of the `verifier`
+
+1. We focus on the `COMMUTATOR` path first (`STRUCTURE_CONST` is simpler):
+
+*What raw_expr parsing needs to extract*, given $[T_1, T_2] = iT_3 + iT_8$:
+* Left side: a list of exactly 2 generator indices inside `[...] → (1, 2)`
+* Right side: a SymPy-parseable expression in terms of `i (→ I)` and `T_k` symbols, which we then need to evaluate as "$T_3$ scaled by $i$, plus $T_8$ scaled by $i$" — i.e., a linear combination of the actual generator matrices, not literal symbols.
+
+That last point is the crux of the design: the right-hand side isn't just a SymPy expression we symbolically simplify — it's a recipe for which generator matrices to combine and with what coefficients, which we then need to substitute against the real matrices from `su_n_generators(N)` and compare against the real computed commutator.
+So the approach:
+* Regex out the two LHS indices from `[T_a, T_b]` (or `[Ta, Tb]`) → handle both underscore and bareword via one regex.
+* Take the RHS string, replace `T_k` / `Tk` tokens with placeholder SymPy symbols (`T1_sym`, `T2_sym`, ...), replace `i` with `I`, then `sympy.sympify()` the result into an expression in terms of those symbols.
+* Extract the coefficient of each `Tk_sym` from the sympified expression (via `.coeff()` or by collecting), giving us a coefficient vector.
+* Build the actual RHS matrix as `sum(coeff_k * T[k-1] for k in ...)` using the real generator matrices.
+* Compute the actual LHS commutator `commutator(T[a-1], T[b-1])`.
+* Compare via `simplify(lhs_matrix - rhs_matrix) == zeros(N,N)`.
+
+2. `STRUCTURE_CONST` parsing: given `raw_expr` like $f_{123}$ = 1 or $f_{246} = \tfrac{1}{2}$, we need:
+
+* Three indices `(a, b, c)` from $f_{abc}$
+* The scalar value, sympified (handles $1,\frac{1}{2}, \frac{\sqrt{3}}{2}$ etc.)
+
+3. With the parsing in place, we wire the `verifier` node:
+* Generator construction per claim: the `Verifier` needs `T` (generator list) for whatever `N` the claim specifies. We have `su_n_generators(N)`, validated for `N=2,3,4`. This is called fresh per claim (build `T = [g/2 for g in su_n_generators(N)]`).
+* What the `Verifier` node catches and records: every step here can throw — `parse_claim` (no `CLAIM` line, bad grammar), `parse_commutator_expr`/`parse_structure_const_expr` (bad indices, malformed expr), or even `su_n_generators` itself if `N` is absurd. Per our "`fail loudly, don't paper over it`" agreement from earlier, the `Verifier` node should catch these (since the graph needs to keep running and produce a result, not crash the whole pipeline), but record the failure explicitly in state rather than silently defaulting verified to False or True.
+
+With these design decisions in place, we assessed the performance of the `verifier` on the original five questions from Stage 1. The results are shown below:
+|Result|Solver's claim|Verifier says|Ground truth|Match?|
+|-----|---------------|------------|-------------|-------|
+|0|`[T1,T2]=iT3`|True|True (Stage 0) |✅|
+|1|`f_123=1`|True|True (Stage 0)|✅|
+|2|`[T4,T5]=(i/2)T3+(i√3/2)T8`|True|True (cross-checked earlier)|✅|
+|3|`f_246=1/2`|True|True (Stage 0)|✅|
+|4|`[T1,T2]=iT3+iT8`|False|False (this is the deliberately-false claim)|✅|
+
+### Design goal for `llm_judge`
+A generic, reusable "ask an LLM to adjudicate something given context" utility, narrow enough for Stage 2's polarity-check, general enough that Stage 3's Critic can call the same function later with a richer payload.
