@@ -85,7 +85,7 @@ The scope for this section was as follows:
 > Since the `Solver` doesn't call `SymPy` and isn't checked, there's a real chance `DeepSeek` just confidently produces wrong group theory (these are exactly the kind of index-gymnastics calculations LLMs flub).
 
 
-### Architecture of state schema and solver at this stage
+### Architecture of state schema and solver]
 * `SolverState` is deliberately minimal (just 2 fields) — this is the contract Stage 2's `Verifier` will need to extend (it'll likely add a `verified: bool or verifier_notes: str` field later). Keeping it lean now means Stage 2's diff is additive, not a rewrite.
 * The node function takes the whole state in and returns the whole state out — that's the `LangGraph` convention (nodes are state transformers), even though right now it feels like overkill for a single field update.
 
@@ -290,4 +290,92 @@ verified: None | polarity_match: None
 verifier_detail: UNPARSEABLE: No line starting with 'CLAIM:' found in solver output.
 ```
 
+---
+## Cyclic Critic-Retry Loop
 
+**Architectural Choices**
+1. **What actually triggers the Critic?**: When `verified == False` OR `polarity_match == False`.
+2. **What does the Critic actually do?**: Feed critique back to Solver for a retry attempt
+3. **Loop termination**: If we retry, we need a max-retry count in state to avoid infinite cycles (`LangGraph` conditional edges need an explicit exit condition).
+
+Based on this, we construct a Retry-Aware Solver Node. A note on a couple of design decisions is in order:
+* `solver_node` now returns `{**state, "solution": ...}` instead of the old Stage 1/2 pattern of returning only `{"problem", "solution"}`. That's a deliberate change — `LangGraph` does a partial-state merge, so returning only two fields would normally be fine, but since the `Critic` clears `critique/increments retry_count/etc.`, we want the solver's return to pass those fields through unchanged rather than risk `LangGraph` defaulting them.
+* The conditional edges dict `{"critic": "critic", END: END}` is required by `LangGraph`'s `add_conditional_edges` API — the routing function's string return values need to map to actual node names (or `END`).
+* No explicit recursion limit set. LangGraph has a default recursion limit (typically 25) as a safety net independent of our own max_retries logic — with `max_retries=3` we'd hit at most ~3 full `solver→verifier→critic` cycles (well under that), so we should be fine, but worth knowing it exists as a backstop in case `route_after_verifier` ever has a bug.
+
+We redo the diagnostic test and obtain the following output:
+
+```
+================================================================================
+PROBLEM 0: Verify that for su(2), [T_1, T_2] = i*T_3, where T_a = sigma_a / 2 and sigma_a are the Pau
+verified: True | polarity_match: True
+verifier_detail: Checked [Ta,Tb] vs claimed RHS for su(2). Equal: True
+================================================================================
+PROBLEM 1: Compute the structure constant f_123 for su(3) using the convention T_a = lambda_a / 2, wh
+verified: True | polarity_match: True
+verifier_detail: f_abc computed=1, claimed=1 for su(3). Equal: True
+================================================================================
+PROBLEM 2: Is the following a valid su(3) commutation relation? [T_4, T_5] = (i/2)*T_3 + (i*sqrt(3)/2
+verified: True | polarity_match: True
+verifier_detail: Checked [Ta,Tb] vs claimed RHS for su(3). Equal: True
+================================================================================
+PROBLEM 3: Compute the structure constant f_246 for su(3) using the convention T_a = lambda_a / 2, wh
+verified: True | polarity_match: True
+verifier_detail: f_abc computed=1/2, claimed=1/2 for su(3). Equal: True
+================================================================================
+PROBLEM 4: Is the following a valid su(3) commutation relation? [T_1, T_2] = i*T_3 + i*T_8
+verified: False | polarity_match: True
+verifier_detail: Checked [Ta,Tb] vs claimed RHS for su(3). Equal: False
+================================================================================
+PROBLEM 5: Is the following a valid su(4) commutation relation? [T_1, T_2] = i*T_3
+verified: True | polarity_match: True
+verifier_detail: Checked [Ta,Tb] vs claimed RHS for su(4). Equal: True
+================================================================================
+PROBLEM 6: Explain, in general terms, why su(3) has exactly 8 generators and what role the Cartan sub
+verified: None | polarity_match: None
+verifier_detail: PARSE_ERROR in expr: Could not parse LHS as f_abc (three single-digit indices): 'f_abc'
+```
+
+> I ran out of credits at this stage. **Recommendation for errors**: swap out Inference Providers for a free one so we can see the full loop work before HF deployment.
+```
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(
+    model="Qwen/Qwen2.5-72B-Instruct",
+    base_url="https://api-inference.huggingface.co/v1",
+    api_key=os.environ["HF_TOKEN"],
+    temperature=0.0,
+)
+
+judge_llm = ChatOpenAI(
+    model="Qwen/Qwen2.5-72B-Instruct",
+    base_url="https://api-inference.huggingface.co/v1",
+    api_key=os.environ["HF_TOKEN"],
+    temperature=0.7,  # some variation for the judge is fine, but not Gemma's full 1.0
+    top_p=0.95,
+)
+```
+
+----
+## Integration with MCP
+
+The goal of Stage 4 was to extract the symbolic `verifier` — which had been living as a set of Python functions called directly inside the `LangGraph` graph — and expose it as a standalone **MCP (Model Context Protocol)** server. The `LangGraph` agent then becomes a thin client that calls the `verifier` over the wire rather than importing it directly. This is the architectural move that makes Stage 4 interesting: the agent and the verifier are now genuinely decoupled, communicating via a standard protocol rather than a Python import.
+
+> Why MCP specifically: MCP is Anthropic's open protocol for connecting AI agents to external tools and data sources. The core idea is that any MCP-compliant server can be called by any MCP-compliant client, regardless of what language or framework either side is written in. For this project, that means the symbolic verifier could in principle be called by a different agent framework entirely, or run on a different machine, without any changes to its code. Choosing MCP here over a simpler alternative (like a `REST API` or just keeping the `SymPy` functions inline) was a deliberate architectural decision: it demonstrates that the agent is built to consume external tools via a standard interface, which is increasingly how production agentic systems are structured. The verifier is also a natural fit for MCP because it is a pure, stateless computation with a clear `input/output` contract — exactly the kind of thing MCP tools are designed for.
+
+**What the server exposes:** a single tool called `verify_lie_algebra_identity`, which accepts the full solver output text as a string, extracts the `CLAIM` line, runs the symbolic verification pipeline (`su_n_generators`, `parse_claim`, `parse_commutator_expr` or `parse_structure_const_expr` depending on claim type, then the SymPy matrix comparison or structure constant lookup), and returns a JSON string with four fields: `verified` (bool or null), `claim_tag` (str or null), `claim_algebra_N` (int or null), and `detail` (a human-readable explanation of what was checked or why parsing failed). All SymPy logic lives inside the server. The agent side has no direct SymPy dependency anymore.
+
+**Transport**: `stdio` was chosen for this stage rather than `SSE `(the HTTP-based alternative). With `stdio`, the client spawns the server as a subprocess and communicates over `stdin/stdout` pipes using JSON-RPC. This has zero infrastructure overhead and is the right choice for a local or Colab environment. The SSE transport swap needed for HF Spaces deployment is localized to two lines: the server entrypoint (`mcp.run(transport="sse")` instead of `stdio`) and the client connection config (an SSE URL instead of `StdioServerParameters`). No tool logic changes at all. 
+
+**Implementation**: the server is a standalone Python file (`mcp_verifier_server.py`) using `FastMCP`, Anthropic's ergonomic wrapper around the reference MCP `SDK`. `FastMCP` lets you register tools by decorating plain Python functions with `@mcp.tool()` — the `SDK` handles JSON-RPC framing, tool discovery, input schema generation from type annotations, and transport I/O. The `verifier_node` in the `LangGraph` graph was replaced with a thin `async` client using `langchain-mcp-adapters` (`StdioServerParameters` + `stdio_client` + `ClientSession`), wrapped in `asyncio.run()` for the sync-to-async bridge.
+
+Three Colab-specific workarounds were required that would not be needed in a real deployment:
+* First, Colab's `stderr` stream has no real file descriptor, so `stdio_client`'s attempt to pass it to the subprocess raises `UnsupportedOperation`. **Fix:** pass `errlog=open("/content/mcp_server_stderr.log", "w")` explicitly to `stdio_client`.
+* Second, Colab's IPython kernel runs its own event loop, which conflicts with `asyncio.run()` called from inside a synchronous `LangGraph` node. **Fix**: call `nest_asyncio.apply()` once at session start.
+* Third, the Python executable is not reliably on `$PATH `in Colab as "python", so `StdioServerParameters` needs `command=sys.executable` to get the full path to the current interpreter.
+
+> One critical operational rule discovered during debugging: never test an MCP stdio server by invoking it directly with python `server.py`. A `stdio` server blocks indefinitely waiting for JSON-RPC input on `stdin` that never comes. The original hang (60+ minutes before the Colab session crashed) was caused by running python `mcp_verifier_server.py --help`, which FastMCP doesn't recognize as a flag and so falls through to `mcp.run(transport="stdio")`, which then blocks. The correct way to verify the server file is `subprocess.run([sys.executable, "server.py"], capture_output=True, timeout=15)` — it spawns the server, which starts listening, gets no input, and the timeout kills it cleanly with `returncode 0`.
+
+> One prompt engineering finding discovered empirically during the batch run: the critic agent was giving incorrect feedback on false claims. When the solver correctly identified a false claim and emitted the original (false) equation on the `CLAIM` line as instructed, the critic would tell it to instead put the corrected true relation on the `CLAIM` line. The solver obeyed, the verifier then returned `verified=True` on the corrected claim, and the loop terminated successfully — having completely changed the subject rather than correctly evaluating the original false claim. The fix was adding an explicit reminder to the critic's output schema prompt: the CLAIM line must always transcribe the exact equation stated in the original problem, never a corrected or different relation. The prose verdict (true or false) is where correctness lives; the CLAIM line is only a precise restatement of what is being evaluated.
+
+**Validation**: full 7-problem batch run with the same benchmark used in Stages 2 and 3. Problems 0 through 3 and Problem 5 all pass on the first attempt with no retries. Problem 4 (the deliberately false su(3) claim) correctly exhausts all 3 retries and terminates with `verified=False`, `polarity_match=True` — the loop correctly identified and maintained the false verdict under critic pressure. Problem 6 (open-ended explanation with no checkable claim) degrades gracefully to `verified=None`, `retry_count=0`, routed to `END` immediately on parse failure. 
