@@ -379,3 +379,46 @@ Three Colab-specific workarounds were required that would not be needed in a rea
 > One prompt engineering finding discovered empirically during the batch run: the critic agent was giving incorrect feedback on false claims. When the solver correctly identified a false claim and emitted the original (false) equation on the `CLAIM` line as instructed, the critic would tell it to instead put the corrected true relation on the `CLAIM` line. The solver obeyed, the verifier then returned `verified=True` on the corrected claim, and the loop terminated successfully — having completely changed the subject rather than correctly evaluating the original false claim. The fix was adding an explicit reminder to the critic's output schema prompt: the CLAIM line must always transcribe the exact equation stated in the original problem, never a corrected or different relation. The prose verdict (true or false) is where correctness lives; the CLAIM line is only a precise restatement of what is being evaluated.
 
 **Validation**: full 7-problem batch run with the same benchmark used in Stages 2 and 3. Problems 0 through 3 and Problem 5 all pass on the first attempt with no retries. Problem 4 (the deliberately false su(3) claim) correctly exhausts all 3 retries and terminates with `verified=False`, `polarity_match=True` — the loop correctly identified and maintained the false verdict under critic pressure. Problem 6 (open-ended explanation with no checkable claim) degrades gracefully to `verified=None`, `retry_count=0`, routed to `END` immediately on parse failure. 
+
+---
+
+## Deployment 
+
+The goal now was to deploy the full Stage 4 multi-agent pipeline (solver → MCP verifier → critic loop) to Hugging Face Spaces with a Gradio frontend, keeping the MCP-over-wire architecture intact rather than inlining the verifier.
+
+**Architecture decision:** SSE transport over `stdio`
+The core challenge of Stage 5 is that `stdio` transport (used in Stage 4) requires spawning a subprocess, which is incompatible with single-container deployment on HF Spaces. The chosen solution runs the MCP verifier server as a background daemon thread inside the same container, binding to `localhost:8000` via `SSE` transport. Gradio runs on port `7860` (HF Spaces default) in the main thread. The `LangGraph` verifier node connects to `http://127.0.0.1:8000/sse` instead of spawning a subprocess. This preserves the full MCP-over-wire story end-to-end.
+
+> The alternative would have inlined the SymPy verifier directly into `app.py`, which would have been simpler but would have eliminated the architectural separation between agent and verifier that Stage 4 established.
+
+**Files produced**
+* `mcp_verifier_server.py`: Modified from Stage 4. The only change is the `entrypoint: mcp.run(transport="sse")` replacing `mcp.run(transport="stdio")`. No tool logic changes. Binds to `127.0.0.1:8000` by default (`FastMCP.run()` accepts only transport and `mount_path` kwargs, not host or port — discovered empirically).
+* `app.py`: New file. Contains the MCP server thread launcher, full `LangGraph` graph (`solver`, SSE `verifier` node, `critic`, `routing` — verbatim from Stage 4 with the `asyncio`/`errlog`/`subprocess` hacks removed), and the Gradio UI.
+* `requirements.txt`: `gradio`, `sympy`, `numpy`, `langgraph`, `langchain-openai`, `langchain`, `langchain-core`, `langchain-mcp-adapters`, `mcp`, `asyncio`
+* `README.md`: HF Spaces YAML frontmatter (`sdk: gradio, sdk_version: 5.50.0, app_file: app.py`) plus architecture description, five-stage roadmap, key technical decisions, and usage instructions.
+
+**Key implementation details**
+* MCP server thread launcher: The thread is started at module import time (not inside a Gradio callback) with a `time.sleep(3)` after start to give the SSE server time to bind before the first client connection. The thread is `daemon=True` so it exits when the main process exits. A critical fix was discovered during debugging: the thread needs its own clean event loop to avoid a `nest_asyncio` conflict with uvicorn. The fix:
+```
+def _start_mcp_server():
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    import mcp_verifier_server
+    mcp_verifier_server.mcp.run(transport="sse")
+```
+Without this, `nest_asyncio`'s patched `asyncio.run()` caused a `TypeError` because `uvicorn`'s newer versions pass a `loop_factory `kwarg that the patched version doesn't accept, crashing the thread repeatedly.
+
+* SSE verifier node: Replaces Stage 4's `stdio` client entirely. Uses `mcp.client.sse.sse_client` instead of `mcp.client.stdio.stdio_client`. No `errlog` parameter needed (SSE uses HTTP, no file descriptor issues). `asyncio.run()` still wraps the async client call inside the sync `LangGraph` node.
+* History tracking: `CriticState` was extended with a `history: list` field to support per-attempt trace display in the UI. `solver_node` appends each attempt's solution to history.
+* `critic_node` stamps the verifier result and critique onto the last history entry before incrementing `retry_count`. The initial state passed to `agent_graph.invoke` must include `"history": []` or the field will be absent from the final state.
+* SymPy parser fix: The `mcp_verifier_server.py` `parse_commutator_expr` function needed two additional regex substitutions before sympify to handle implicit multiplication in LLM output 
+```
+"i T_3" → "i*T3"
+rhs_substituted = re.sub(r'(\bi)\s+(__T\d+__)', r'\1*\2', rhs_substituted)
+rhs_substituted = re.sub(r'(\d)\s+(__T\d+__)', r'\1*\2', rhs_substituted)
+```
+
+Without this, any LLM output that wrote "`i T_3`" instead of "`i*T_3`" caused a `SyntaxError` in `sympify`.
+
+* Gradio UI: Two-column layout. Left column: problem input, Run button, four static example problems (loaded via `gr.Examples`, no API call), status indicator. Right column: final verdict (`verified/unverified/unparseable` with icons), verifier detail, full reasoning trace with per-attempt solver output and critic feedback. `run_pipeline` is a generator function (yield not return) so Gradio shows a "`running...`" state immediately while the graph executes. All four output boxes must be yielded together on every yield call.
