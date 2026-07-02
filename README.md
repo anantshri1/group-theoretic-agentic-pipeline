@@ -16,8 +16,8 @@ You submit a group theory problem — a commutator identity or structure constan
 **Pipeline**
 ```
 User problem
-│
-▼
+       │
+       ▼
 ┌─────────────┐
 │  Solver     │  Qwen2.5-72B via HF Inference Router
 │  Agent      │  Emits structured CLAIM line
